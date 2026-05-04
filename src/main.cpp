@@ -7,6 +7,7 @@
 #include <iostream>
 #include <cstdio>
 #include <thread>
+#include <string>
 #include "SDL3/SDL.h"
 #include "SDL3/SDL_main.h"
 #include <SDL3/SDL_opengl.h>
@@ -51,19 +52,26 @@ struct appstate {
 	SDL_Window* window;
 	SDL_GLContext gl_context;
 	ImGuiIO io;
-	bool active;
-	float my_color[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
-	wchar_t current_file[MAX_PATH];
+	wchar_t current_file[MAX_PATH],
+		current_playlist[MAX_PATH],
+		last_error[256];
 	wchar_t* filename;
 	struct wave_file* current_wave;
-	bool loadFile = false, playingAudio = false, pauseAudio = false;
-	double current_time = 0.0;
-	size_t start_addr = 0;
-	size_t end_addr = 0;
-	size_t current_addr = 0;
-	double audio_dt = 0;
-	double num_seconds = 0;
-	int bufferFrames = 0;
+	bool loadFile = false,
+		playingAudio = false,
+		makePlaylist = false,
+		selectPlaylist = false,
+		active;
+	size_t start_addr = 0, 
+		end_addr = 0, 
+		current_addr = 0;
+	double current_time = 0.0, 
+		audio_dt = 0, 
+		num_seconds = 0;
+	int bufferFrames = 0,
+		playlist_selected = 0;
+	vector <char*> songs, 
+		playlists;
 };
 
 RtAudio* audio;
@@ -169,25 +177,37 @@ static int saw(void* outputBuffer, void* inputBuffer, unsigned int nBufferFrames
 	return 0;
 }
 
-struct wave_file* analyzeWAV(wchar_t* fileSelected)
+static void log_Error(struct appstate* state, const wchar_t* message, DWORD id) {
+	if (id) {
+		wchar_t* error_msg = NULL;
+		FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, id, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPWSTR)&error_msg, 0, NULL);
+		swprintf(state->last_error, sizeof(state->last_error), L"%s. Error: %ls", message, error_msg);
+		LocalFree(error_msg);
+	}
+	else {
+		swprintf(state->last_error, sizeof(state->last_error), L"%s", message);
+	}
+}
+
+struct wave_file* analyzeWAV(struct appstate* state, wchar_t* fileSelected)
 {
 	LPCWSTR wav_filepath = fileSelected;
 	HANDLE file = CreateFileW(wav_filepath, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (file == INVALID_HANDLE_VALUE) {
-		fwprintf(stderr, L"Failed to open file: %ls\n", wav_filepath);
+		log_Error(state, L"Failed to open file.", GetLastError());
 		return NULL;
 	}
 
 	HANDLE hmap = CreateFileMappingW(file, NULL, PAGE_READONLY, 0, 0, NULL);
 	if (hmap == NULL) {
-		fwprintf(stderr, L"Failed to create file mapping: %ls\n", wav_filepath);
+		log_Error(state, L"Failed to create file mapping.", GetLastError());
 		CloseHandle(file);
 		return NULL;
 	}
 
 	LPVOID file_data = MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, 0);
 	if (file_data == NULL) {
-		fwprintf(stderr, L"Failed to map view of file: %ls\n", wav_filepath);
+		log_Error(state, L"Failed to map view of file.", GetLastError());
 		CloseHandle(hmap);
 		CloseHandle(file);
 		return NULL;
@@ -222,7 +242,7 @@ struct wave_file* analyzeWAV(wchar_t* fileSelected)
 	//UnmapViewOfFile(file_data);
 }
 
-static void load_file(struct appstate* state) {
+static void load_file(struct appstate* state, wchar_t* file_to_load=NULL) {
 	// close previous file if open
 	if (state->current_wave) {
 		UnmapViewOfFile(state->current_wave->mapped_data);
@@ -231,6 +251,18 @@ static void load_file(struct appstate* state) {
 		free(state->current_wave);
 		state->current_wave = NULL;
 		state->current_time = 0;
+	}
+
+	if (file_to_load) {
+		state->current_file[0] = '\0';
+		wcscpy_s(state->current_file, file_to_load);
+		state->current_wave = analyzeWAV(state, file_to_load);
+		state->filename = state->current_file + lstrlenW(state->current_playlist) + 1;
+		state->start_addr = (size_t)state->current_wave->file_data.wave_data.data_ptr;
+		state->current_addr = state->start_addr;
+		state->bufferFrames = state->current_wave->file_data.fmt_chunk.sample_rate;
+		state->loadFile = false;
+		return;
 	}
 
 	// open windows file explorer select file dialog and get path to file
@@ -246,11 +278,10 @@ static void load_file(struct appstate* state) {
 	ofn.nFilterIndex = 1;
 	ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
 	if (GetOpenFileNameW(&ofn)) {
-		wprintf(L"Selected file: %ls\n", ofn.lpstrFile);
 		state->current_file[0] = '\0';
 		wcscpy_s(state->current_file, ofn.lpstrFile);
 		state->filename = state->current_file + ofn.nFileOffset;
-		state->current_wave = analyzeWAV(state->current_file);
+		state->current_wave = analyzeWAV(state, state->current_file);
 		state->start_addr = (size_t)state->current_wave->file_data.wave_data.data_ptr;
 		state->current_addr = state->start_addr;
 		state->bufferFrames = state->current_wave->file_data.fmt_chunk.sample_rate;
@@ -259,6 +290,17 @@ static void load_file(struct appstate* state) {
 		wprintf(L"File selection cancelled.\n");
 	}
 	state->loadFile = false;
+}
+
+static void popup_Error(struct appstate* state) {
+	if (ImGui::BeginPopupModal("Error", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::Text("%ls", state->last_error);
+		if (ImGui::Button("OK", ImVec2(120, 0))) { 
+			ImGui::CloseCurrentPopup(); 
+			state->last_error[0] = '\0';
+		}
+		ImGui::EndPopup();
+	}
 }
 
 static void load_graphs(struct appstate* state) {
@@ -312,11 +354,7 @@ static void load_graphs(struct appstate* state) {
 void playAudio(struct appstate* state) {
 	RtAudio* dac = audio;
 	if (dac->getDeviceCount() < 1) {
-		if(ImGui::BeginPopupModal("Error", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-			ImGui::Text("No audio devices found!");
-			if (ImGui::Button("OK", ImVec2(120, 0))) {ImGui::CloseCurrentPopup();}
-			ImGui::EndPopup();
-		}
+		log_Error(state, L"No audio devices found!", 0);
 		return;
 	}
 	RtAudio::StreamParameters parameters;
@@ -327,20 +365,14 @@ void playAudio(struct appstate* state) {
 	unsigned int bufferFrames = state->bufferFrames;
 
 	if (dac->openStream(&parameters, NULL, state->current_wave->file_data.fmt_chunk.bytes_per_sample, sampleRate, &bufferFrames, &saw, state)) {
-		if(ImGui::BeginPopupModal("Error", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-			ImGui::Text("Failed to open audio stream! Error: %s", dac->getErrorText().c_str());
-			if (ImGui::Button("OK", ImVec2(120, 0))) {ImGui::CloseCurrentPopup();}
-			ImGui::EndPopup();
-		}
+		log_Error(state, L"Failed to open audio stream!", 0);
 		return;
 	}
 
 	if (dac->startStream()) {
-		if(ImGui::BeginPopupModal("Error", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-			ImGui::Text("Failed to start audio stream! Error: %s", dac->getErrorText().c_str());
-			if (ImGui::Button("OK", ImVec2(120, 0))) {ImGui::CloseCurrentPopup();}
-			ImGui::EndPopup();
-		}
+		wchar_t error_message[256];
+		swprintf(error_message, sizeof(error_message), L"Failed to start audio stream! Error: %ls", dac->getErrorText().c_str());
+		log_Error(state, error_message, 0);
 		return;
 	}
 	state->playingAudio = true;
@@ -350,6 +382,107 @@ void playAudio(struct appstate* state) {
 	if (dac->isStreamOpen()) dac->closeStream();
 }
 
+static void make_playlist(struct appstate* state) {
+	// create folder in same directory as executable called "playlist"
+	 if(!CreateDirectoryW(L"playlist", NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+		 log_Error(state, L"Failed to create playlist directory", GetLastError());
+	 }
+
+	 if (ImGui::BeginPopupModal("Name of Playlist", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+		 static char playlist_name[50] = "My Playlist";
+		 ImGui::InputText("Playlist Name", playlist_name, sizeof(playlist_name));
+		 if (ImGui::Button("Create", ImVec2(120, 0))) {
+			 wchar_t playlist_path[MAX_PATH];
+			 swprintf(playlist_path, MAX_PATH, L"playlist\\%S", playlist_name);
+			 if(CreateDirectoryW(playlist_path, NULL)) {
+				 wmemcpy(state->current_playlist, playlist_path, MAX_PATH);
+				 ImGui::CloseCurrentPopup();
+			 }
+			 else {
+				 log_Error(state, L"Failed to create playlist directory", GetLastError());
+			 }
+			 state->makePlaylist = false;
+		 }
+		 ImGui::SameLine();
+		 if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+			 ImGui::CloseCurrentPopup();
+			 state->makePlaylist = false;
+		 }
+		 ImGui::EndPopup();
+	 }
+}
+
+static void select_playlist(struct appstate* state) {
+	wchar_t dirPath[MAX_PATH] = L"playlist";
+	WIN32_FIND_DATAW findData;
+	HANDLE hFind = FindFirstFileW(L"playlist\\*", &findData);
+	if (hFind == INVALID_HANDLE_VALUE) {
+		log_Error(state, L"Failed to open directory", GetLastError());
+		return;
+	}
+
+	for(int i = 0; i < state->playlists.size(); i++) {
+		free(state->playlists[i]);
+	}
+	vector<char*> playlists;
+	int default_index = -1;
+	do {
+		if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			if (wcscmp(findData.cFileName, L".") != 0 && wcscmp(findData.cFileName, L"..") != 0) {
+				char playlist_name[MAX_PATH];
+				size_t converted_chars = 0;
+				wcstombs_s(&converted_chars, playlist_name, findData.cFileName, MAX_PATH);
+				playlists.insert(playlists.end(), _strdup(playlist_name));
+			}
+		}
+	} while (FindNextFileW(hFind, &findData));
+	FindClose(hFind);
+
+	state->playlists.swap(playlists);
+
+	if(ImGui::BeginPopup("Select Playlist", ImGuiWindowFlags_NoMove)) {
+		for (size_t i = 0; i < state->playlists.size(); i++) {
+			if (ImGui::Selectable(state->playlists[i], default_index == (int)i)) {
+				wchar_t playlist_path[MAX_PATH];
+				swprintf(playlist_path, MAX_PATH, L".\\playlist\\%S", state->playlists[i]);
+				wmemcpy(state->current_playlist, playlist_path, MAX_PATH);
+			}
+		}
+		state->selectPlaylist = false;
+		ImGui::EndPopup();
+	}
+}
+
+static void refresh_songs(struct appstate* state) {
+	for (size_t i = 0; i < state->songs.size(); i++) {
+		free(state->songs[i]);
+	}
+
+	// list files in playlist directory
+	wchar_t dirPath[MAX_PATH];
+	swprintf(dirPath, MAX_PATH, L"%ls\\*", state->current_playlist);
+	WIN32_FIND_DATAW findData;
+	HANDLE hFind = FindFirstFileW(dirPath, &findData);
+	if (hFind == INVALID_HANDLE_VALUE) {
+		log_Error(state, L"Failed to open directory", GetLastError());
+		ImGui::EndTabItem();
+		return;
+	}
+	int i = 0;
+	vector<char*> songs;
+	while (FindNextFileW(hFind, &findData)) {
+		if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+			char* song_name = (char*)malloc(sizeof(char) * MAX_PATH + 1);
+			size_t converted = 0;
+			wcstombs_s(&converted, song_name, MAX_PATH, findData.cFileName, MAX_PATH);
+			songs.push_back(song_name);
+			i++;
+		}
+	}
+	FindClose(hFind);
+	state->songs.swap(songs);
+}
+
 static void mainApp(struct appstate* state) {
 	ImGui::Begin("Wavd", NULL, ImGuiWindowFlags_NoCollapse | 
 		ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | 
@@ -357,50 +490,109 @@ static void mainApp(struct appstate* state) {
 		ImGuiWindowFlags_MenuBar);
 
 	if (state->loadFile) { load_file(state); }
+	make_playlist(state);
+	select_playlist(state);
+	popup_Error(state);
+	if (state->last_error[0] != '\0') { ImGui::OpenPopup("Error"); }
+	if (state->makePlaylist) { ImGui::OpenPopup("Name of Playlist"); }
+	if (state->selectPlaylist) { ImGui::OpenPopup("Select Playlist"); }
 
 	if (ImGui::BeginMainMenuBar()) {
 		ImGui::MenuItem("Load File", NULL, &state->loadFile, !state->playingAudio);
+		ImGui::MenuItem("Make Playlist", NULL, &state->makePlaylist, !state->playingAudio);
+		ImGui::MenuItem("Select Playlist", NULL, &state->selectPlaylist, !state->playingAudio);
 		ImGui::EndMainMenuBar();
 	}
 
 	ImGui::SetNextWindowSizeConstraints(ImVec2(state->io.DisplaySize.x*0.15, 0), ImVec2(state->io.DisplaySize.x * 0.325, FLT_MAX));
-	if (ImGui::BeginChild("child1", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_ResizeX)) {
-		if (state->current_wave) {
-			ImGui::Text("Filename: %ls", state->filename);
-			ImGui::Text("Audio Format: %s", state->current_wave->file_data.fmt_chunk.audio_format == PCM_FORMAT ? "PCM" : "Unknown");
-			ImGui::Text("Channels: %d", state->current_wave->file_data.fmt_chunk.num_channels);
-			ImGui::Text("Sample Rate: %d hz", state->current_wave->file_data.fmt_chunk.sample_rate);
-			ImGui::Text("Byte Rate: %d bytes/s", state->current_wave->file_data.fmt_chunk.byte_rate);
-			ImGui::Text("Block Align: %d", state->current_wave->file_data.fmt_chunk.block_align);
-			ImGui::Text("Bits Per Sample: %d bits", state->current_wave->file_data.fmt_chunk.bits_per_sample);
-			ImGui::Text("Data Size: %d bytes", state->current_wave->file_data.wave_data.data_size);
-			ImGui::Text("Current Address: 0x%p", state->current_addr);
-			ImGui::Text("Audio playing: %s", state->playingAudio ? "Yes" : "No");
-			ImGui::Text("Buffer Frames: %d", state->bufferFrames);
+	if (ImGui::BeginChild("child1", ImVec2(0, 0), ImGuiChildFlags_ResizeX, ImGuiWindowFlags_NoScrollbar)) {
+		if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_AutoSelectNewTabs)) {
+			if (ImGui::BeginTabItem("File Info")) {
+				if (state->current_wave) {
+					ImGui::Text("Filename: %ls", state->filename);
+					ImGui::Text("Audio Format: %s", state->current_wave->file_data.fmt_chunk.audio_format == PCM_FORMAT ? "PCM" : "Unknown");
+					ImGui::Text("Channels: %d", state->current_wave->file_data.fmt_chunk.num_channels);
+					ImGui::Text("Sample Rate: %d hz", state->current_wave->file_data.fmt_chunk.sample_rate);
+					ImGui::Text("Byte Rate: %d bytes/s", state->current_wave->file_data.fmt_chunk.byte_rate);
+					ImGui::Text("Block Align: %d", state->current_wave->file_data.fmt_chunk.block_align);
+					ImGui::Text("Bits Per Sample: %d bits", state->current_wave->file_data.fmt_chunk.bits_per_sample);
+					ImGui::Text("Data Size: %d bytes", state->current_wave->file_data.wave_data.data_size);
+					ImGui::Text("Current Address: 0x%p", state->current_addr);
+					ImGui::Text("Audio playing: %s", state->playingAudio ? "Yes" : "No");
+					ImGui::Text("Buffer Frames: %d", state->bufferFrames);
 
-			char play_button_label[20];
-			snprintf(play_button_label, sizeof(play_button_label), "%s Audio", state->playingAudio ? "Pause" : "Play");
-			if (ImGui::Button(play_button_label, ImVec2(-1, 0))) {
-				if (!state->playingAudio) {
-					thread audio_thread(playAudio, state);
-					audio_thread.detach();
+					char play_button_label[20];
+					snprintf(play_button_label, sizeof(play_button_label), "%s Audio", state->playingAudio ? "Pause" : "Play");
+					if (ImGui::Button(play_button_label, ImVec2(-1, 0))) {
+						if (!state->playingAudio) {
+							thread audio_thread(playAudio, state);
+							audio_thread.detach();
+						}
+						else {
+							state->playingAudio = false;
+						}
+					}
+
+					mem_edit_2.DrawContents((short*)state->start_addr, state->end_addr - state->start_addr, state->start_addr);
 				}
 				else {
-					state->playingAudio = false;
+					ImGui::Text("No file loaded.");
 				}
+				ImGui::EndTabItem();
 			}
 
-			mem_edit_2.DrawContents((short*)state->start_addr, state->end_addr-state->start_addr, state->start_addr);
-		}
-		else {
-			ImGui::Text("No file loaded.");
+			if(lstrlenW(state->current_playlist) > 0) {
+				if (ImGui::BeginTabItem("Playlist")) {
+					refresh_songs(state);
+					ImGui::Text("Current Playlist: %ls", state->current_playlist);
+					ImGui::Text("Current song: %s", state->songs.size() > 0 ? state->songs[state->playlist_selected] : "None");
+					if(ImGui::Button("Add Song", ImVec2(-1, 0))) {
+						wchar_t file_path[MAX_PATH];
+						OPENFILENAMEW ofn;
+						ZeroMemory(&ofn, sizeof(ofn));
+						ofn.lStructSize = sizeof(ofn);
+						ofn.hwndOwner = NULL;
+						ofn.lpstrFile = file_path;
+						ofn.lpstrFile[0] = '\0';
+						ofn.nMaxFile = sizeof(file_path);
+						ofn.lpstrFilter = L"WAV Files\0*.wav\0All Files\0*.*\0";
+						ofn.nFilterIndex = 1;
+						ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+						if (GetOpenFileNameW(&ofn)) {
+							wchar_t dest_path[MAX_PATH];
+							swprintf(dest_path, MAX_PATH, L"%ls\\%ls", state->current_playlist, ofn.lpstrFile + ofn.nFileOffset);
+							if (!CopyFileW(ofn.lpstrFile, dest_path, FALSE)) {
+								log_Error(state, L"Failed to add song to playlist!", GetLastError());
+							}
+						}
+					}
+
+
+					if (ImGui::BeginListBox("##playlist_songs", ImVec2(-1, -1))) {
+						for (size_t i = 0; i < state->songs.size(); i++) {
+							if (ImGui::Selectable(state->songs[i], state->playlist_selected == i)) {
+								state->playlist_selected = i;
+								wchar_t full_path[MAX_PATH];
+								WCHAR wide_song[MAX_PATH];
+								mbstowcs_s(NULL, wide_song, MAX_PATH, state->songs[i], MAX_PATH);
+								swprintf(full_path, MAX_PATH, L"%ls\\%ls", state->current_playlist, wide_song);
+								load_file(state, full_path);
+							}
+						}
+						ImGui::EndListBox();
+					}
+
+					ImGui::EndTabItem();
+				}
+			}
+			ImGui::EndTabBar();
 		}
 	}
 	ImGui::EndChild();
 
 	ImGui::SameLine();
 
-	if (ImGui::BeginChild("child2", ImVec2(0, 0), ImGuiChildFlags_Borders) && state->current_wave != NULL) {
+	if (ImGui::BeginChild("child2", ImVec2(0, 0)) && state->current_wave != NULL) {
 		load_graphs(state);
 	}
 	ImGui::EndChild();
