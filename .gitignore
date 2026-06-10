@@ -363,3 +363,4 @@ MigrationBackup/
 FodyWeavers.xsd
 /playlist
 /imgui.ini
+/vcpkg_installed/x64-windows
